@@ -23,7 +23,7 @@ if __name__=="__main__":
     print(f"Account key at path `{DERIVATION}`:", account)
     print(f"Xpub at path `{DERIVATION}`:", xpub)
 
-    d = LDescriptor.from_string(f"blinded(slip77({mbk}),wpkh({xpub}/{{0,1}}/*))")
+    d = LDescriptor.from_string(f"blinded(slip77({mbk}),wpkh([{root.my_fingerprint.hex()}{DERIVATION[1:]}]{xpub}/{{0,1}}/*))")
     print("Descriptor:", d)
     for i in range(5):
         addr = d.derive(i).address(NETWORK)
