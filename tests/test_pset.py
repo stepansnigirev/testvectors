@@ -1,3 +1,4 @@
+from typing import OrderedDict
 from embit import bip32, bip39
 from embit.liquid.networks import get_network
 from embit.liquid import slip77
@@ -7,6 +8,7 @@ from embit.liquid.pset import PSET
 from embit.liquid.finalizer import finalize_psbt
 from embit.liquid.transaction import LSIGHASH as SIGHASH
 import random
+import pytest
 
 # liquid regtest can have any name except main, test, regtest, liquidv1 and liquidtestnet
 NET = get_network("liquidregtest")
@@ -16,17 +18,50 @@ SEED = bip39.mnemonic_to_seed(MNEMONIC)
 ROOTKEY = bip32.HDKey.from_seed(SEED, version=NET["xprv"])
 FGP = ROOTKEY.my_fingerprint.hex() # fingerprint for derivation
 MBK = slip77.master_blinding_from_seed(SEED) # master blinding key
+MBK_WIF = MBK.wif()
 
 # some random cosigner xpubs
 SEEDS = [bytes([i]*32) for i in range(1,5)]
 COSIGNERS = [bip32.HDKey.from_seed(seed, version=NET["xprv"]) for seed in SEEDS]
 
 # uncomment more lines to add more sighashes
-ALL_SIGHASHES = [SIGHASH.ALL, SIGHASH.NONE, SIGHASH.SINGLE]
-# ALL_SIGHASHES = ALL_SIGHASHES + [sh | SIGHASH.ANYONECANPAY for sh in ALL_SIGHASHES]
-# ALL_SIGHASHES = ALL_SIGHASHES + [sh | SIGHASH.RANGEPROOF for sh in ALL_SIGHASHES]
+BASIC_SIGHASHES = [SIGHASH.ALL, SIGHASH.NONE, SIGHASH.SINGLE]
+ALL_SIGHASHES = BASIC_SIGHASHES
+ALL_SIGHASHES = ALL_SIGHASHES + [sh | SIGHASH.ANYONECANPAY for sh in BASIC_SIGHASHES]
+ALL_SIGHASHES = ALL_SIGHASHES + [sh | SIGHASH.RANGEPROOF for sh in BASIC_SIGHASHES]
+ALL_SIGHASHES = ALL_SIGHASHES + [sh | SIGHASH.ANYONECANPAY | SIGHASH.RANGEPROOF for sh in BASIC_SIGHASHES]
 
-def sign_psbt(psbt:str, root=ROOTKEY):
+def sighash_to_str(sh: int) -> str:
+    if sh is None or sh == -1:
+        return "DEFAULT"
+
+    base = sh & ~(SIGHASH.ANYONECANPAY|SIGHASH.RANGEPROOF)
+    base_str = {
+        SIGHASH.DEFAULT: "DEFAULT",
+        SIGHASH.ALL: "ALL",
+        SIGHASH.NONE: "NONE",
+        SIGHASH.SINGLE: "SINGLE"
+    }
+
+    try:
+        res = base_str[base]
+    except KeyError:
+        raise ValueError("invalid SIGHASH flags")
+
+    if sh & SIGHASH.ANYONECANPAY:
+        res += "|ANYONECANPAY"
+    if sh & SIGHASH.RANGEPROOF:
+        res += "|RANGEPROOF"
+
+    return res
+
+def sign_psbt(wallet_rpc, psbt:str, sighash=None):
+    """Replace with your tested functionality"""
+    sighash_str = sighash_to_str(sighash) if sighash is not None else "DEFAULT"
+    signed_psbt = wallet_rpc.walletprocesspsbt(psbt, True, sighash_str)['psbt']
+    return signed_psbt
+
+def sign_psbt_embit(psbt:str, root=ROOTKEY):
     """Replace with your tested functionality"""
     psbt = PSET.from_string(psbt)
     psbt.sign_with(root, sighash=None) # tell embit to sign with whatever sighash is provided
@@ -45,7 +80,7 @@ def create_wallet(erpc, d1, d2, mbk=MBK):
     # to add checksums
     d1 = add_checksum(str(d1))
     d2 = add_checksum(str(d2))
-    erpc.createwallet(wname, True, True, "", False, True, False)
+    erpc.createwallet(wname, False, True, "", False, True, False)
     w = erpc.wallet(wname)
     res = w.importdescriptors([{
             "desc": d1,
@@ -100,7 +135,7 @@ def create_psbt(erpc, w, amount=0.1, destination=None, confidential=True, confid
         blinded = w.blindpsbt(unblinded)
     except:
         try:
-            blinded = w.walletprocesspsbt(unblinded)['psbt']
+            blinded = w.walletprocesspsbt(unblinded, False)['psbt']
         except:
             blinded = None
     # inject sighash for all inputs
@@ -127,90 +162,205 @@ def check_psbt(erpc, unsigned, signed, sighash=None):
     # test accept
     assert erpc.testmempoolaccept([raw])[0]["allowed"]
 
-def bulk_check(erpc, descriptors):
+def sighash_from_signed_pset(signed: str) -> int:
+    sighash = -1
+    psbt = PSET.from_string(signed)
+    for inp in psbt.inputs:
+        for sig in inp.partial_sigs.values():
+            if sighash < 0:
+                sighash = sig[-1]
+            else:
+                assert sig[-1] == sighash
+        if inp.final_scriptwitness:
+            sig_items = inp.final_scriptwitness.items
+            sig = sig_items[0] if sig_items[0] else sig_items[1]
+            if sig:
+                if sighash < 0:
+                    sighash = sig[-1]
+                else:
+                    assert sig[-1] == sighash
+    return sighash
+
+def get_signatures(signed_pset: str) -> dict:
+    psbt = PSET.from_string(signed_pset)
+    sigs = OrderedDict()
+
+    for inp_idx, inp in enumerate(psbt.inputs):
+        sigs[inp_idx] = OrderedDict()
+        if inp.partial_sigs:
+            sigs[inp_idx]['partial_sigs'] = [sig.hex() for sig in inp.partial_sigs.values()]
+        if inp.final_scriptwitness:
+            sigs[inp_idx]['final_scriptwitness'] = [item.hex() for item in inp.final_scriptwitness.items]
+        if inp.final_scriptsig:
+            sigs[inp_idx]['final_scriptsig'] = inp.final_scriptsig.data.hex()
+
+    return sigs
+
+def bulk_check(erpc, descriptors, collector, mode: str = 'all'):
     w = create_wallet(erpc, *descriptors)
     fund_wallet(erpc, w, 10, confidential=True)
-    for sh in ALL_SIGHASHES:
-        unblinded, blinded = create_psbt(erpc, w, sighash=sh)
-        # blinding may fail if all inputs and outputs are confidential, so fund_wallet will return None in blinded
-        unsigned = blinded or unblinded
-        signed = sign_psbt(unsigned)
-        check_psbt(erpc, unsigned, signed, sighash=sh)
-    # test all confidential-unconfidential pairs
-    for conf_input in [True, False]:
-        w = create_wallet(erpc, *descriptors)
-        fund_wallet(erpc, w, 10, confidential=conf_input)
-        for conf_destination in [True, False]:
-            unblinded, blinded = create_psbt(erpc, w, confidential=conf_destination)
+    if mode in ['sighashes', 'all']:
+        for sh in ALL_SIGHASHES:
+            unblinded, blinded = create_psbt(erpc, w, sighash=sh)
             # blinding may fail if all inputs and outputs are confidential, so fund_wallet will return None in blinded
             unsigned = blinded or unblinded
-            signed = sign_psbt(unsigned)
-            check_psbt(erpc, unsigned, signed)
+            signed = sign_psbt(w, unsigned, sighash=sh)
+            check_psbt(erpc, unsigned, signed, sighash=sh)
+            collector.add_test(
+                pset=unsigned,
+                signatures=get_signatures(signed),
+                sighash=sh,
+                description=f"Confidential: both, sighash: {sighash_to_str(sh)}"
+            )
+
+    # test all confidential-unconfidential pairs
+    conf_status = {
+        (False, False): "none",
+        (True, False): "input",
+        (False, True): "output",
+        (True, True): "both"
+    }
+    if mode in ['blinded_unblinded', 'all']:
+        for conf_input in [True, False]:
+            w = create_wallet(erpc, *descriptors)
+            fund_wallet(erpc, w, 10, confidential=conf_input)
+            for conf_destination in [True, False]:
+                unblinded, blinded = create_psbt(erpc, w, confidential=conf_destination)
+                # blinding may fail if all inputs and outputs are confidential, so fund_wallet will return None in blinded
+                unsigned = blinded or unblinded
+                signed = sign_psbt(w, unsigned)
+                check_psbt(erpc, unsigned, signed)
+                sh = sighash_from_signed_pset(signed)
+                collector.add_test(
+                    pset=unsigned,
+                    signatures=get_signatures(signed),
+                    sighash=sh,
+                    description=(f"Confidential: {conf_status[(conf_input, conf_destination)]}, "
+                                f"sighash: {sighash_to_str(sh)}")
+                )
+
+def derivation_quote(path: str) -> str:
+    return path.replace("h", "'")
 
 ##########################
 
-def test_wpkh(erpc):
+
+@pytest.mark.parametrize("mode", ['sighashes', 'blinded_unblinded'])
+def test_wpkh(erpc, collector, mode):
     derivation = "84h/1h/0h"
-    xpub = ROOTKEY.derive(f"m/{derivation}").to_public()
+    xprv = ROOTKEY.derive(f"m/{derivation}")
+    xpub = xprv.to_public()
     # change and receive descriptors
     descriptors = (
-        f"wpkh([{FGP}/{derivation}]{xpub}/0/*)",
-        f"wpkh([{FGP}/{derivation}]{xpub}/1/*)"
+        f"wpkh([{FGP}/{derivation}]{xprv}/0/*)",
+        f"wpkh([{FGP}/{derivation}]{xprv}/1/*)"
     )
-    bulk_check(erpc, descriptors)
 
-def test_sh_wpkh(erpc):
+    collector.define_suite(
+        kind="valid",
+        name="wpkh",
+        mbk=MBK_WIF,
+        policy_map="wpkh(@0)",
+        keys_info=[f"[{FGP}/{derivation_quote(derivation)}]{xpub}/**"],
+        description="Single signature P2WPKH"
+    )
+    bulk_check(erpc, descriptors, collector, mode)
+
+@pytest.mark.parametrize("mode", ['sighashes', 'blinded_unblinded'])
+def test_sh_wpkh(erpc, collector, mode):
     derivation = "49h/1h/0h"
-    xpub = ROOTKEY.derive(f"m/{derivation}").to_public()
+    xprv = ROOTKEY.derive(f"m/{derivation}")
+    xpub = xprv.to_public()
     # change and receive descriptors
     descriptors = (
-        f"sh(wpkh([{FGP}/{derivation}]{xpub}/0/*))",
-        f"sh(wpkh([{FGP}/{derivation}]{xpub}/1/*))"
+        f"sh(wpkh([{FGP}/{derivation}]{xprv}/0/*))",
+        f"sh(wpkh([{FGP}/{derivation}]{xprv}/1/*))"
     )
-    bulk_check(erpc, descriptors)
+    collector.define_suite(
+        kind="valid",
+        name="sh_wpkh",
+        mbk=MBK_WIF,
+        policy_map="sh(wpkh(@0))",
+        keys_info=[f"[{FGP}/{derivation_quote(derivation)}]{xpub}/**"],
+        description="Single signature P2SH-P2WPKH"
+    )
+    bulk_check(erpc, descriptors, collector, mode)
 
-def test_pkh(erpc):
+@pytest.mark.parametrize("mode", ['sighashes', 'blinded_unblinded'])
+def test_pkh(erpc, collector, mode):
     derivation = "44h/1h/0h"
-    xpub = ROOTKEY.derive(f"m/{derivation}").to_public()
+    xprv = ROOTKEY.derive(f"m/{derivation}")
+    xpub = xprv.to_public()
     # change and receive descriptors
     descriptors = (
-        f"pkh([{FGP}/{derivation}]{xpub}/0/*)",
-        f"pkh([{FGP}/{derivation}]{xpub}/1/*)"
+        f"pkh([{FGP}/{derivation}]{xprv}/0/*)",
+        f"pkh([{FGP}/{derivation}]{xprv}/1/*)"
     )
-    bulk_check(erpc, descriptors)
+    collector.skip_suite() # Legacy transactions are not currently supported
+    bulk_check(erpc, descriptors, collector, mode)
 
-def test_wsh(erpc):
+@pytest.mark.parametrize("mode", ['sighashes', 'blinded_unblinded'])
+def test_wsh(erpc, collector, mode):
     # 1-of-2 multisig
     derivation = "48h/1h/0h/2h"
-    xpub = ROOTKEY.derive(f"m/{derivation}").to_public()
+    xprv = ROOTKEY.derive(f"m/{derivation}")
+    xpub = xprv.to_public()
     cosigner = COSIGNERS[0].derive(f"m/{derivation}").to_public()
     # change and receive descriptors
     descriptors = (
-        f"wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xpub}/0/*))",
-        f"wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xpub}/1/*))"
+        f"wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xprv}/0/*))",
+        f"wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xprv}/1/*))"
     )
-    bulk_check(erpc, descriptors)
+    collector.define_suite(
+        kind="valid",
+        name="wsh_sortedmulti",
+        mbk=MBK_WIF,
+        policy_map="wsh(sortedmulti(1,@0,@1))",
+        keys_info=[
+            f"[12345678/{derivation_quote(derivation)}]{cosigner}/**",
+            f"[{FGP}/{derivation_quote(derivation)}]{xpub}/**",
+        ],
+        description="Multiple signature 1-of-2 P2WSH"
+    )
+    bulk_check(erpc, descriptors, collector, mode)
 
-def test_sh_wsh(erpc):
+@pytest.mark.parametrize("mode", ['sighashes', 'blinded_unblinded'])
+def test_sh_wsh(erpc, collector, mode):
     # 1-of-2 multisig
     derivation = "48h/1h/0h/1h"
-    xpub = ROOTKEY.derive(f"m/{derivation}").to_public()
+    xprv = ROOTKEY.derive(f"m/{derivation}")
+    xpub = xprv.to_public()
     cosigner = COSIGNERS[0].derive(f"m/{derivation}").to_public()
     # change and receive descriptors
     descriptors = (
-        f"sh(wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xpub}/0/*)))",
-        f"sh(wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xpub}/1/*)))"
+        f"sh(wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xprv}/0/*)))",
+        f"sh(wsh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xprv}/1/*)))"
     )
-    bulk_check(erpc, descriptors)
+    collector.define_suite(
+        kind="valid",
+        name="sh_wsh_sortedmulti",
+        mbk=MBK_WIF,
+        policy_map="sh(wsh(sortedmulti(1,@0,@1)))",
+        keys_info=[
+            f"[12345678/{derivation_quote(derivation)}]{cosigner}/**",
+            f"[{FGP}/{derivation_quote(derivation)}]{xpub}/**",
+        ],
+        description="Multiple signature 1-of-2 P2SH-P2WSH"
+    )
+    bulk_check(erpc, descriptors, collector, mode)
 
-def test_sh(erpc):
+@pytest.mark.parametrize("mode", ['sighashes', 'blinded_unblinded'])
+def test_sh(erpc, collector, mode):
     # 1-of-2 multisig
     derivation = "45h"
-    xpub = ROOTKEY.derive(f"m/{derivation}").to_public()
+    xprv = ROOTKEY.derive(f"m/{derivation}")
+    xpub = xprv.to_public()
     cosigner = COSIGNERS[0].derive(f"m/{derivation}").to_public()
     # change and receive descriptors
     descriptors = (
-        f"sh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xpub}/0/*))",
-        f"sh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xpub}/1/*))"
+        f"sh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xprv}/0/*))",
+        f"sh(sortedmulti(1,[12345678/{derivation}]{cosigner},[{FGP}/{derivation}]{xprv}/1/*))"
     )
-    bulk_check(erpc, descriptors)
+    collector.skip_suite() # Legacy transactions are not currently supported
+    bulk_check(erpc, descriptors, collector, mode)
+
