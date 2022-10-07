@@ -14,3 +14,5 @@ release
 .DS_Store
 nodedata
 tests/blockchain
+pytest.ini
+test_data.json
