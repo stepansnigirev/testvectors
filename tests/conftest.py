@@ -13,7 +13,7 @@ RPCUSER = "liquid"
 RPCPASSWORD = "secret"
 RPCPORT = 18998
 PORT = 18999
-ELEMETSD = os.environ.get("ELEMETSD_CMD", default="elemetsd")
+ELEMETSD = os.environ.get("ELEMETSD_CMD", default="elementsd")
 CMD = f"{ELEMETSD} -datadir={DATADIR} -chain=liquidregtest \
         -rpcuser={RPCUSER} -rpcpassword={RPCPASSWORD} -rpcport={RPCPORT} -port={PORT} \
         -fallbackfee=0.0000001 -validatepegin=0 -initialfreecoins=2100000000000000"
